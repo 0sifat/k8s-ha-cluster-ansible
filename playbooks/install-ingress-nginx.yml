@@ -1,0 +1,94 @@
+---
+- name: Install NGINX Ingress Controller using Helm
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Add ingress-nginx Helm repository
+      command: helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Update Helm repositories
+      command: helm repo update
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: List available Helm repositories
+      command: helm repo list
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: repo_list
+
+    - name: Display Helm repositories
+      debug:
+        var: repo_list.stdout
+
+    - name: Create ingress-nginx namespace (fixed syntax)
+      shell: |
+        kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Install ingress-nginx using Helm
+      command: |
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx \
+          --set controller.replicaCount=2 \
+          --set controller.nodeSelector."kubernetes\.io/os"=linux \
+          --set controller.admissionWebhooks.patch.nodeSelector."kubernetes\.io/os"=linux \
+          --set defaultBackend.nodeSelector."kubernetes\.io/os"=linux \
+          --set controller.service.type=LoadBalancer \
+          --set controller.service.externalTrafficPolicy=Local \
+          --set controller.ingressClassResource.name=nginx \
+          --set controller.ingressClassResource.default=true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for ingress-nginx to be ready
+      command: kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Check ingress-nginx pods
+      command: kubectl get pods -n ingress-nginx
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ingress_pods
+
+    - name: Display ingress-nginx pods status
+      debug:
+        var: ingress_pods.stdout
+
+    - name: Check ingress-nginx services
+      command: kubectl get svc -n ingress-nginx
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ingress_svc
+
+    - name: Display ingress-nginx services
+      debug:
+        var: ingress_svc.stdout
+
+    - name: Get the external IP/LB address
+      command: kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ingress_ip
+      ignore_errors: yes
+
+    - name: Display ingress external IP
+      debug:
+        var: ingress_ip.stdout
+
+    - name: Check Helm releases
+      command: helm list -A
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: helm_releases
+
+    - name: Display Helm releases
+      debug:
+        var: helm_releases.stdout

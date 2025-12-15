@@ -1,0 +1,88 @@
+---
+- name: Force upgrade containerd on problematic nodes
+  hosts: masters[1:]  # master-2 and master-3
+  become: yes
+
+  tasks:
+    - name: Force remove containerd and dependencies
+      apt:
+        name: "{{ item }}"
+        state: absent
+        purge: yes
+        force: yes
+      loop:
+        - containerd
+        - docker.io
+        - docker-ce
+        - docker-ce-cli
+      ignore_errors: yes
+
+    - name: Remove containerd configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/containerd
+        - /var/lib/containerd
+        - /var/run/containerd
+      ignore_errors: yes
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+
+    - name: Install latest containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate containerd config
+      command: containerd config default
+      register: containerd_config
+
+    - name: Save containerd config
+      copy:
+        content: "{{ containerd_config.stdout }}"
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+
+    - name: Enable systemd cgroup in containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '            SystemdCgroup = false'
+        replace: '            SystemdCgroup = true'
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for containerd socket
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        timeout: 30
+
+    - name: Verify containerd version
+      command: containerd --version
+      register: containerd_ver
+
+    - name: Display containerd version
+      debug:
+        var: containerd_ver.stdout
+
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: Wait for kubelet to stabilize
+      pause:
+        seconds: 30

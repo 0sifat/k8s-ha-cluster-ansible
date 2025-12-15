@@ -1,0 +1,125 @@
+---
+- name: Apply Common Fixes for API Server Issues
+  hosts: masters[0]
+  become: yes
+  gather_facts: yes
+  tasks:
+    # Fix 1: Ensure swap is completely disabled
+    - name: Disable swap immediately
+      shell: swapoff -a
+
+    - name: Remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '.*swap.*'
+        state: absent
+
+    # Fix 2: Restart containerd
+    - name: Restart containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+
+    - name: Wait for containerd to be ready
+      wait_for:
+        timeout: 10
+
+    # Fix 3: Check and fix containerd config
+    - name: Verify containerd config has systemd cgroup
+      shell: grep -A 3 'runc.options' /etc/containerd/config.toml | grep SystemdCgroup
+      register: cgroup_check
+      ignore_errors: yes
+
+    - name: Display cgroup configuration
+      debug:
+        var: cgroup_check.stdout
+
+    - name: Fix containerd cgroup if needed
+      block:
+        - name: Backup containerd config
+          copy:
+            src: /etc/containerd/config.toml
+            dest: /etc/containerd/config.toml.backup
+            remote_src: yes
+
+        - name: Regenerate containerd config
+          shell: |
+            rm /etc/containerd/config.toml
+            containerd config default > /etc/containerd/config.toml
+            sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+        - name: Restart containerd after config change
+          systemd:
+            name: containerd
+            state: restarted
+      when: cgroup_check.rc != 0 or 'true' not in cgroup_check.stdout
+
+    # Fix 4: Restart kubelet
+    - name: Restart kubelet service
+      systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
+    - name: Wait for kubelet to stabilize
+      wait_for:
+        timeout: 15
+
+    # Fix 5: Check if API server needs restart
+    - name: Check API server pod status
+      shell: crictl ps | grep kube-apiserver
+      register: api_status
+      ignore_errors: yes
+
+    - name: Restart API server if not running
+      block:
+        - name: Stop API server container
+          shell: |
+            API_CONTAINER=$(crictl ps -a | grep kube-apiserver | awk '{print $1}')
+            if [ ! -z "$API_CONTAINER" ]; then
+              crictl stop $API_CONTAINER
+              crictl rm $API_CONTAINER
+            fi
+          ignore_errors: yes
+
+        - name: Wait for kubelet to recreate API server
+          wait_for:
+            timeout: 30
+
+        - name: Restart kubelet to force recreation
+          systemd:
+            name: kubelet
+            state: restarted
+      when: api_status.rc != 0
+
+    # Fix 6: Verify API server health
+    - name: Wait for API server to respond
+      shell: |
+        for i in {1..30}; do
+          if curl -k https://127.0.0.1:6443/healthz 2>/dev/null | grep -q ok; then
+            echo "API server is healthy"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "API server still not healthy"
+        exit 1
+      register: health_check
+      ignore_errors: yes
+
+    - name: Display health check result
+      debug:
+        var: health_check.stdout
+
+    # Fix 7: Check kubectl access
+    - name: Test kubectl access
+      shell: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: kubectl_test
+      ignore_errors: yes
+
+    - name: Display kubectl result
+      debug:
+        var: kubectl_test.stdout_lines

@@ -1,0 +1,67 @@
+---
+- name: Fix etcd cluster issues
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Check etcd cluster status
+      command: etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key member list
+      register: etcd_members
+      ignore_errors: yes
+
+    - name: Display etcd members
+      debug:
+        var: etcd_members.stdout
+
+    - name: Check etcd pod status
+      command: kubectl get pods -n kube-system -l component=etcd
+      register: etcd_pods
+      ignore_errors: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Display etcd pods
+      debug:
+        var: etcd_pods.stdout
+
+    - name: Check etcd pod logs
+      command: kubectl logs -n kube-system -l component=etcd --tail=20
+      register: etcd_logs
+      ignore_errors: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Display etcd logs
+      debug:
+        var: etcd_logs.stdout
+
+    - name: Check etcd container status
+      shell: docker ps | grep etcd || crictl pods | grep etcd
+      register: etcd_containers
+      ignore_errors: yes
+
+    - name: Display etcd containers
+      debug:
+        var: etcd_containers.stdout
+
+    - name: Restart etcd pods if needed
+      command: kubectl delete pod -n kube-system -l component=etcd
+      when: etcd_pods.rc == 0
+      ignore_errors: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for etcd to recover
+      pause:
+        seconds: 30
+
+    - name: Check if cluster is responsive
+      command: kubectl get nodes
+      register: cluster_status
+      ignore_errors: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Display cluster status
+      debug:
+        var: cluster_status.stdout

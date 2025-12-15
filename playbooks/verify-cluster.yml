@@ -1,0 +1,94 @@
+---
+- name: Verify Kubernetes HA Cluster
+  hosts: masters
+  become: yes
+  gather_facts: no
+  vars:
+    load_balancer_ip: "3.7.251.55"  # Add this variable definition
+  
+  tasks:
+    - name: Check cluster info
+      shell: kubectl cluster-info
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_info
+
+    - name: Display cluster info
+      debug:
+        var: cluster_info.stdout_lines
+
+    - name: Get all nodes
+      shell: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_status
+
+    - name: Display nodes status
+      debug:
+        var: nodes_status.stdout_lines
+
+    - name: Get all pods in all namespaces
+      shell: kubectl get pods -A -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: all_pods
+
+    - name: Display all pods
+      debug:
+        var: all_pods.stdout_lines
+
+    - name: Check component status
+      shell: kubectl get cs
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: component_status
+      ignore_errors: yes
+
+    - name: Display component status
+      debug:
+        var: component_status.stdout_lines
+      when: component_status.rc == 0
+
+    - name: Get etcd cluster health
+      shell: |
+        kubectl -n kube-system exec etcd-{{ inventory_hostname }} -- etcdctl \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          endpoint health
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: etcd_health
+      ignore_errors: yes
+
+    - name: Display etcd health
+      debug:
+        var: etcd_health.stdout_lines
+      when: etcd_health.rc == 0
+
+- name: Verify HAProxy
+  hosts: lb  # Changed from 'loadbalancer' to match your inventory group name
+  become: yes
+  gather_facts: no
+  vars:
+    load_balancer_ip: "3.7.251.55"  # Add this variable definition here too
+  
+  tasks:
+    - name: Check HAProxy status
+      shell: systemctl status haproxy
+      register: haproxy_status
+      ignore_errors: yes
+
+    - name: Display HAProxy status
+      debug:
+        var: haproxy_status.stdout_lines
+
+    - name: Test connection to API server through LoadBalancer
+      shell: curl -k https://{{ load_balancer_ip }}:6443/version  # Fixed variable name
+      register: api_test
+      ignore_errors: yes
+
+    - name: Display API test result
+      debug:
+        var: api_test.stdout_lines  # Fixed from .stdout to .stdout_lines

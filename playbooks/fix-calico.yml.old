@@ -1,0 +1,47 @@
+---
+- name: Fix Calico networking issues
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Check failing Calico pod logs
+      command: kubectl logs -n kube-system -l k8s-app=calico-node --tail=50
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_logs
+      ignore_errors: yes
+
+    - name: Display Calico logs
+      debug:
+        var: calico_logs.stdout
+
+    - name: Check specific failing Calico pod
+      command: kubectl describe pod -n kube-system -l k8s-app=calico-node --field-selector=status.phase!=Running
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_describe
+      ignore_errors: yes
+
+    - name: Display Calico pod details
+      debug:
+        var: calico_describe.stdout
+
+    - name: Delete failing Calico pods to restart them
+      command: kubectl delete pod -n kube-system -l k8s-app=calico-node --field-selector=status.phase!=Running
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Wait for Calico pods to restart
+      pause:
+        seconds: 30
+
+    - name: Check Calico pod status after restart
+      command: kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_status
+
+    - name: Display Calico status
+      debug:
+        var: calico_status.stdout

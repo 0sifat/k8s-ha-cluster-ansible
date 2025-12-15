@@ -1,0 +1,142 @@
+---
+- name: Install HAProxy
+  apt:
+    name: haproxy
+    state: present
+    update_cache: yes
+
+- name: Stop HAProxy temporarily
+  systemd:
+    name: haproxy
+    state: stopped
+
+- name: Remove any existing config
+  file:
+    path: /etc/haproxy/haproxy.cfg
+    state: absent
+
+- name: Create HAProxy configuration for Kubernetes
+  copy:
+    content: |
+      global
+          daemon
+          log /dev/log local0
+          user haproxy
+          group haproxy
+
+      defaults
+          mode tcp
+          timeout connect 5000
+          timeout client 50000
+          timeout server 50000
+          option dontlognull
+          option tcplog
+
+      frontend kubernetes
+          bind *:6443
+          default_backend k8s_masters
+
+      backend k8s_masters
+          balance roundrobin
+          option tcp-check
+          # Master nodes - will be marked down initially but HAProxy will still bind to port
+          server master-1 {{ hostvars['master-1'].ansible_host | default('master-1') }}:6443 check port 6443 inter 10s fall 3 rise 2
+          server master-2 {{ hostvars['master-2'].ansible_host | default('master-2') }}:6443 check port 6443 inter 10s fall 3 rise 2  
+          server master-3 {{ hostvars['master-3'].ansible_host | default('master-3') }}:6443 check port 6443 inter 10s fall 3 rise 2
+
+      # Statistics page for monitoring
+      listen stats
+          bind *:8080
+          mode http
+          stats enable
+          stats uri /
+          stats refresh 10s
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Verify HAProxy configuration syntax
+  shell: haproxy -c -f /etc/haproxy/haproxy.cfg
+  register: haproxy_config_check
+  ignore_errors: yes
+
+- name: Debug HAProxy config check
+  debug:
+    var: haproxy_config_check
+
+- name: Start HAProxy service
+  systemd:
+    name: haproxy
+    enabled: yes
+    state: started
+
+- name: Wait for HAProxy to initialize
+  pause:
+    seconds: 5
+
+- name: Check HAProxy service status
+  systemd:
+    name: haproxy
+  register: haproxy_service_status
+
+- name: Debug HAProxy service status
+  debug:
+    var: haproxy_service_status
+
+- name: Check HAProxy process
+  shell: ps aux | grep haproxy | grep -v grep
+  register: haproxy_process
+  ignore_errors: yes
+
+- name: Debug HAProxy process
+  debug:
+    var: haproxy_process.stdout
+
+- name: Comprehensive port check
+  shell: |
+    echo "=== Checking port 6443 ==="
+    ss -tlnp | grep 6443 || netstat -tlnp | grep 6443 || echo "Port 6443 not found"
+    echo "=== Checking port 8080 (stats) ==="  
+    ss -tlnp | grep 8080 || netstat -tlnp | grep 8080 || echo "Port 8080 not found"
+    echo "=== HAProxy status ==="
+    systemctl status haproxy --no-pager -l | tail -5
+  register: comprehensive_check
+  ignore_errors: yes
+
+- name: Debug comprehensive check
+  debug:
+    var: comprehensive_check.stdout
+
+# ========== ADD THE FINAL STATUS TASKS HERE ==========
+- name: Verify HAProxy is listening on port 6443
+  wait_for:
+    host: "0.0.0.0"
+    port: 6443
+    delay: 5
+    timeout: 30
+    state: started
+  register: haproxy_port_check
+  ignore_errors: yes
+
+- name: Get final HAProxy service status
+  shell: |
+    systemctl is-active haproxy && echo "ACTIVE" || echo "INACTIVE"
+  register: final_service_status
+  ignore_errors: yes
+
+- name: Final HAProxy status
+  debug:
+    msg: |
+      HAProxy Final Status:
+      - Service: {{ final_service_status.stdout }}
+      - Port 6443: {% if haproxy_port_check is succeeded %}LISTENING{% else %}NOT LISTENING{% endif %}
+      - Process: {% if haproxy_process.stdout %}RUNNING{% else %}NOT RUNNING{% endif %}
+      - Config: {% if haproxy_config_check.rc == 0 %}VALID{% else %}INVALID - check logs{% endif %}
+      
+      {% if haproxy_port_check is failed %}
+      NOTE: If port 6443 is not listening, this may be because:
+      1. All backend servers (masters) are unavailable
+      2. HAProxy will bind when masters come online
+      3. This is normal during initial cluster setup
+      {% endif %}

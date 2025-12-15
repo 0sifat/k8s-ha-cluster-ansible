@@ -1,0 +1,49 @@
+---
+- name: Check logs of failing components
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Check etcd-master-2 logs
+      command: kubectl logs -n kube-system etcd-master-2 --tail=20
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: etcd2_logs
+      ignore_errors: yes
+
+    - name: Display etcd-master-2 logs
+      debug:
+        var: etcd2_logs.stdout
+
+    - name: Check etcd-master-3 logs
+      command: kubectl logs -n kube-system etcd-master-3 --tail=20
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: etcd3_logs
+      ignore_errors: yes
+
+    - name: Display etcd-master-3 logs
+      debug:
+        var: etcd3_logs.stdout
+
+    - name: Check kube-apiserver-master-2 logs
+      command: kubectl logs -n kube-system kube-apiserver-master-2 --tail=20
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api2_logs
+      ignore_errors: yes
+
+    - name: Display kube-apiserver-master-2 logs
+      debug:
+        var: api2_logs.stdout
+
+    - name: Check kube-scheduler logs
+      command: kubectl logs -n kube-system -l component=kube-scheduler --tail=10
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: scheduler_logs
+      ignore_errors: yes
+
+    - name: Display scheduler logs
+      debug:
+        var: scheduler_logs.stdout

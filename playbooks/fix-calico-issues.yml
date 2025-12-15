@@ -1,0 +1,241 @@
+---
+- name: Comprehensive Calico troubleshooting and fix
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    # ========== STEP 1: CHECK CURRENT STATE ==========
+    - name: Check current node status
+      command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: node_status
+      ignore_errors: yes
+
+    - name: Display node status
+      debug:
+        var: node_status.stdout
+
+    - name: Check all pods in kube-system
+      command: kubectl get pods -n kube-system -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: all_pods
+      ignore_errors: yes
+
+    - name: Display all pods
+      debug:
+        var: all_pods.stdout
+
+    # ========== STEP 2: CHECK CALICO SPECIFICALLY ==========
+    - name: Check if Calico is installed
+      command: kubectl get daemonset -n kube-system calico-node 2>/dev/null || echo "NOT_INSTALLED"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_daemonset
+      ignore_errors: yes
+
+    - name: Display Calico daemonset status
+      debug:
+        var: calico_daemonset.stdout
+
+    - name: Get Calico pod details
+      command: kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_pods
+      ignore_errors: yes
+
+    - name: Display Calico pods
+      debug:
+        var: calico_pods.stdout
+
+    # ========== STEP 3: CHECK LOGS FOR FAILING PODS ==========
+    - name: Get logs from failing Calico pods
+      shell: |
+        for pod in $(kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers -o custom-columns=":metadata.name" 2>/dev/null); do
+          echo "=== Logs for pod $pod ==="
+          kubectl logs -n kube-system $pod --tail=20 2>/dev/null || echo "Cannot get logs for $pod"
+          echo ""
+        done
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_logs_all
+      ignore_errors: yes
+
+    - name: Display Calico logs
+      debug:
+        var: calico_logs_all.stdout
+
+    - name: Describe failing Calico pods
+      shell: |
+        for pod in $(kubectl get pods -n kube-system -l k8s-app=calico-node --field-selector=status.phase!=Running --no-headers -o custom-columns=":metadata.name" 2>/dev/null); do
+          echo "=== Description for pod $pod ==="
+          kubectl describe pod -n kube-system $pod 2>/dev/null || echo "Cannot describe $pod"
+          echo ""
+        done
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_describe_all
+      ignore_errors: yes
+
+    - name: Display Calico pod descriptions
+      debug:
+        var: calico_describe_all.stdout
+
+    # ========== STEP 4: CHECK SYSTEM CONFIGURATION ==========
+    - name: Check kubelet config
+      shell: |
+        cat /var/lib/kubelet/config.yaml 2>/dev/null | grep -i cgroup || echo "No cgroup config found"
+      register: kubelet_config
+      ignore_errors: yes
+
+    - name: Display kubelet config
+      debug:
+        var: kubelet_config.stdout
+
+    - name: Check containerd config
+      shell: |
+        grep -i "systemdcgroup" /etc/containerd/config.toml || echo "No SystemdCgroup config found"
+      register: containerd_config
+      ignore_errors: yes
+
+    - name: Display containerd config
+      debug:
+        var: containerd_config.stdout
+
+    # ========== STEP 5: FIX COMMON ISSUES ==========
+    - name: Remove Calico if installed but broken
+      shell: |
+        kubectl delete -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml --ignore-not-found=true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'calico-node' in calico_daemonset.stdout"
+      ignore_errors: yes
+
+    - name: Wait for cleanup
+      pause:
+        seconds: 20
+
+    - name: Remove any remaining Calico resources
+      shell: |
+        kubectl delete pods -n kube-system -l k8s-app=calico-node --force --grace-period=0 2>/dev/null || true
+        kubectl delete daemonset -n kube-system calico-node --ignore-not-found=true
+        kubectl delete deployment -n kube-system calico-kube-controllers --ignore-not-found=true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    # ========== STEP 6: INSTALL CALICO WITH CUSTOM CONFIG ==========
+    - name: Download and customize Calico manifest
+      shell: |
+        curl -fsSL -o /tmp/calico-custom.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+        # Set the pod CIDR to match kubeadm
+        sed -i 's|# - name: CALICO_IPV4POOL_CIDR|  - name: CALICO_IPV4POOL_CIDR|' /tmp/calico-custom.yaml
+        sed -i 's|#   value: "192.168.0.0/16"|    value: "10.244.0.0/16"|' /tmp/calico-custom.yaml
+        # Disable IPv6 (common source of issues)
+        sed -i 's|            - name: IP6|            # - name: IP6|' /tmp/calico-custom.yaml
+        sed -i 's|            - name: CALICO_IPV6POOL_CIDR|            # - name: CALICO_IPV6POOL_CIDR|' /tmp/calico-custom.yaml
+        # Ensure SystemdCgroup is used
+        echo "Custom Calico manifest created"
+      ignore_errors: yes
+
+    - name: Install customized Calico
+      shell: |
+        kubectl apply -f /tmp/calico-custom.yaml --validate=false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_install
+      ignore_errors: yes
+
+    - name: Display Calico installation result
+      debug:
+        var: calico_install
+
+    # ========== STEP 7: WAIT AND VERIFY ==========
+    - name: Wait for Calico to initialize
+      pause:
+        seconds: 30
+
+    - name: Check Calico pod status after installation
+      command: kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_status_new
+      ignore_errors: yes
+
+    - name: Display new Calico status
+      debug:
+        var: calico_status_new.stdout
+
+    - name: Check CoreDNS status
+      command: kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: coredns_status
+      ignore_errors: yes
+
+    - name: Display CoreDNS status
+      debug:
+        var: coredns_status.stdout
+
+    # ========== STEP 8: FALLBACK TO FLANNEL IF CALICO FAILS ==========
+    - name: Install Flannel if Calico still fails
+      block:
+        - name: Remove Calico
+          shell: |
+            kubectl delete -f /tmp/calico-custom.yaml --ignore-not-found=true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          ignore_errors: yes
+
+        - name: Install Flannel
+          shell: |
+            kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: flannel_install
+          ignore_errors: yes
+
+        - name: Display Flannel installation
+          debug:
+            var: flannel_install
+
+        - name: Wait for Flannel
+          pause:
+            seconds: 30
+
+        - name: Check Flannel status
+          command: kubectl get pods -n kube-flannel -o wide
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: flannel_status
+          ignore_errors: yes
+
+        - name: Display Flannel status
+          debug:
+            var: flannel_status.stdout
+      when: >
+        calico_status_new is defined and 
+        calico_status_new.stdout is defined and
+        ('Running' not in calico_status_new.stdout or '0/1' in calico_status_new.stdout)
+
+    # ========== STEP 9: FINAL CHECK ==========
+    - name: Final cluster status check
+      shell: |
+        echo "=== NODE STATUS ==="
+        kubectl get nodes -o wide
+        echo ""
+        echo "=== ALL PODS IN KUBE-SYSTEM ==="
+        kubectl get pods -n kube-system -o wide
+        echo ""
+        echo "=== NETWORK PLUGIN STATUS ==="
+        kubectl get pods -A -o wide | grep -E "(calico|flannel|coredns)"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: final_status
+      ignore_errors: yes
+
+    - name: Display final status
+      debug:
+        var: final_status.stdout

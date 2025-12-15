@@ -1,0 +1,111 @@
+---
+- name: Setup Kubernetes on all nodes
+  hosts: all
+  become: yes
+  vars:
+    k8s_version: "1.30.2"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+
+    - name: Clean up existing Kubernetes repository
+      shell: |
+        rm -f /etc/apt/sources.list.d/kubernetes*.list 2>/dev/null || true
+        rm -f /etc/apt/trusted.gpg.d/kubernetes*.gpg 2>/dev/null || true
+        apt-get clean
+
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
+        chmod 644 /etc/apt/keyrings/kubernetes.gpg
+
+    - name: Add Kubernetes repository
+      shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Update apt cache with retry
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update
+      until: apt_update is succeeded
+      retries: 5
+      delay: 10
+
+    - name: Check available Kubernetes packages
+      shell: |
+        apt-cache madison kubelet | head -5
+      register: kubelet_available
+      changed_when: false
+
+    - name: Display available packages
+      debug:
+        var: kubelet_available.stdout_lines
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Configure containerd
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        systemctl restart containerd
+        systemctl enable containerd
+
+    - name: Install Kubernetes packages with exact version
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - "kubelet={{ k8s_version }}-1.1"
+        - "kubeadm={{ k8s_version }}-1.1"
+        - "kubectl={{ k8s_version }}-1.1"
+      when: "'k8s-ha-cluster' not in group_names"  # Skip on load balancer if not needed
+
+    - name: Install only kubelet and kubectl on workers (no kubeadm)
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - "kubelet={{ k8s_version }}-1.1"
+        - "kubectl={{ k8s_version }}-1.1"
+      when: "'workers' in group_names"
+
+    - name: Skip Kubernetes installation on load balancer
+      debug:
+        msg: "Skipping Kubernetes installation on load balancer"
+      when: "'lb' in group_names"
+
+    - name: Hold Kubernetes packages
+      shell: |
+        apt-mark hold kubelet kubeadm kubectl 2>/dev/null || true
+      when: "'lb' not in group_names"
+
+    - name: Enable kubelet (don't start it yet)
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: stopped
+        daemon_reload: yes
+      when: "'lb' not in group_names"

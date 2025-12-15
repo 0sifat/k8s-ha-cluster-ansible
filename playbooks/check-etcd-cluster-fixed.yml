@@ -1,0 +1,50 @@
+---
+- name: Check etcd cluster status
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Check etcd member list using kubectl exec
+      shell: |
+        kubectl -n kube-system exec etcd-master-1 -- etcdctl \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          member list -w table
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: etcd_members
+      ignore_errors: yes
+
+    - name: Display etcd members
+      debug:
+        var: etcd_members.stdout
+
+    - name: Check etcd cluster health using kubectl exec
+      shell: |
+        kubectl -n kube-system exec etcd-master-1 -- etcdctl \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          endpoint health
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: etcd_health
+      ignore_errors: yes
+
+    - name: Display etcd health
+      debug:
+        var: etcd_health.stdout
+
+    - name: Check current pod status
+      command: kubectl get pods -A --field-selector=status.phase!=Running
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: failing_pods
+      ignore_errors: yes
+
+    - name: Display failing pods
+      debug:
+        var: failing_pods.stdout

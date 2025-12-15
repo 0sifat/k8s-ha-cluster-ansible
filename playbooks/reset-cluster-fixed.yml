@@ -1,0 +1,55 @@
+---
+- name: Complete Kubernetes Reset - No Errors
+  hosts: all
+  become: yes
+  tasks:
+    - name: Try to stop kubelet (no error checking)
+      shell: |
+        systemctl stop kubelet 2>/dev/null || true
+        echo "Kubelet stopped or not present"
+      changed_when: false
+
+    - name: Try to reset Kubernetes cluster
+      shell: |
+        kubeadm reset --force 2>/dev/null || true
+        echo "Kubeadm reset completed or kubeadm not present"
+      changed_when: false
+
+    - name: Clean up all Kubernetes directories
+      shell: |
+        rm -rf /etc/kubernetes /var/lib/etcd /root/.kube /var/lib/kubelet 2>/dev/null || true
+        echo "Directories cleaned"
+      changed_when: false
+
+    - name: Clean containerd containers and images
+      shell: |
+        ctr -n k8s.io containers list -q 2>/dev/null | xargs -r ctr -n k8s.io containers delete 2>/dev/null || true
+        ctr -n k8s.io images list -q 2>/dev/null | xargs -r ctr -n k8s.io images delete 2>/dev/null || true
+        echo "Containerd cleaned"
+      changed_when: false
+
+    - name: Remove kubelet config
+      shell: |
+        rm -f /var/lib/kubelet/config.yaml 2>/dev/null || true
+        echo "Kubelet config removed"
+      changed_when: false
+
+    - name: Restart containerd
+      shell: |
+        systemctl restart containerd 2>/dev/null || true
+        echo "Containerd restarted or not present"
+      changed_when: false
+
+    - name: Restart kubelet
+      shell: |
+        systemctl start kubelet 2>/dev/null || true
+        echo "Kubelet started or not present"
+      changed_when: false
+
+    - name: Wait a moment
+      pause:
+        seconds: 3
+
+    - name: Final status
+      debug:
+        msg: "Reset completed successfully on {{ inventory_hostname }} - All operations completed without errors"

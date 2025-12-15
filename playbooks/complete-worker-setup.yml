@@ -1,0 +1,181 @@
+---
+- name: Complete setup and join for worker nodes
+  hosts: workers
+  become: yes
+
+  tasks:
+    - name: Check if kubeadm is installed on worker nodes
+      command: which kubeadm
+      register: kubeadm_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Kubernetes components on worker nodes if needed
+      block:
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+
+        - name: Install required packages
+          apt:
+            name:
+              - curl
+              - gnupg
+            state: present
+
+        - name: Add Kubernetes GPG key
+          shell: |
+            curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          args:
+            creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+        - name: Add Kubernetes repository
+          shell: |
+            echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+          args:
+            creates: /etc/apt/sources.list.d/kubernetes.list
+
+        - name: Update apt cache after adding repo
+          apt:
+            update_cache: yes
+
+        - name: Install Kubernetes components
+          apt:
+            name:
+              - kubelet=1.28.15-1.1
+              - kubeadm=1.28.15-1.1
+              - kubectl=1.28.15-1.1
+            state: present
+            force_apt_get: yes
+
+        - name: Prevent automatic updates
+          command: apt-mark hold kubelet kubeadm kubectl
+
+        - name: Ensure kubelet is enabled
+          systemd:
+            name: kubelet
+            enabled: yes
+
+        - name: Disable swap
+          command: swapoff -a
+          ignore_errors: yes
+
+        - name: Comment out swap in fstab
+          lineinfile:
+            path: /etc/fstab
+            regexp: '^[^#].*swap'
+            line: '# \0'
+            backrefs: yes
+
+        - name: Load kernel modules
+          command: modprobe {{ item }}
+          loop:
+            - overlay
+            - br_netfilter
+
+        - name: Configure sysctl
+          shell: |
+            cat <<EOF | tee /etc/sysctl.d/k8s.conf
+            net.bridge.bridge-nf-call-iptables = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv4.ip_forward = 1
+            EOF
+            sysctl --system
+          args:
+            creates: /etc/sysctl.d/k8s.conf
+
+      when: kubeadm_check.rc != 0
+
+    - name: Check if containerd is running on worker nodes
+      systemd:
+        name: containerd
+        state: started
+      register: containerd_status
+      ignore_errors: yes
+
+    - name: Install and configure containerd on worker nodes if needed
+      block:
+        - name: Install containerd
+          apt:
+            name: containerd
+            state: present
+
+        - name: Create containerd config directory
+          file:
+            path: /etc/containerd
+            state: directory
+            mode: '0755'
+
+        - name: Generate containerd config
+          command: containerd config default
+          register: containerd_config
+
+        - name: Save containerd config
+          copy:
+            content: "{{ containerd_config.stdout }}"
+            dest: /etc/containerd/config.toml
+            mode: '0644'
+
+        - name: Enable systemd cgroup
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: '            SystemdCgroup = false'
+            replace: '            SystemdCgroup = true'
+
+        - name: Start containerd
+          systemd:
+            name: containerd
+            state: started
+            enabled: yes
+            daemon_reload: yes
+
+        - name: Wait for containerd socket
+          wait_for:
+            path: /var/run/containerd/containerd.sock
+            timeout: 30
+
+      when: containerd_status is failed or containerd_status.failed
+
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+
+    # Now join the worker nodes
+    - name: Check if node is already joined
+      command: kubectl get nodes {{ inventory_hostname }}
+      register: node_check
+      delegate_to: "{{ groups['masters'][0] }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Set node joined fact
+      set_fact:
+        node_joined: "{{ node_check.rc == 0 }}"
+
+    - name: Get join command from first master
+      command: kubeadm token create --print-join-command
+      register: join_command
+      delegate_to: "{{ groups['masters'][0] }}"
+      run_once: true
+      when: not node_joined
+
+    - name: Join worker node to cluster
+      command: "{{ join_command.stdout }}"
+      when: not node_joined
+      async: 600
+      poll: 10
+
+    - name: Wait for worker node to be ready
+      command: kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+      delegate_to: "{{ groups['masters'][0] }}"
+      when: not node_joined
+
+    - name: Verify worker node joined successfully
+      command: kubectl get nodes {{ inventory_hostname }} -o wide
+      register: final_node_status
+      delegate_to: "{{ groups['masters'][0] }}"
+
+    - name: Display final node status
+      debug:
+        var: final_node_status.stdout

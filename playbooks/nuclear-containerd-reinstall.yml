@@ -1,0 +1,61 @@
+---
+- name: Nuclear Containerd Reinstall
+  hosts: all
+  become: yes
+  tasks:
+    - name: Completely remove containerd
+      apt:
+        name: containerd.io
+        state: absent
+        purge: yes
+        autoremove: yes
+      ignore_errors: yes
+
+    - name: Remove all containerd files and directories
+      shell: |
+        rm -rf /etc/containerd /var/lib/containerd /var/run/containerd /usr/bin/containerd* 2>/dev/null || true
+        echo "All containerd files removed"
+      changed_when: false
+
+    - name: Reinstall containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate default config using containerd
+      shell: |
+        containerd config default > /etc/containerd/config.toml
+        echo "Default config generated"
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Enable systemd cgroup
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^            SystemdCgroup = false'
+        line: '            SystemdCgroup = true'
+        backrefs: yes
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Test containerd
+      shell: |
+        sleep 5
+        ctr version && echo "SUCCESS" || echo "FAILED"
+      register: test_result
+
+    - name: Show final result
+      debug:
+        var: test_result.stdout

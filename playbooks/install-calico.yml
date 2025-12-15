@@ -1,0 +1,25 @@
+---
+- name: Install Calico Network Plugin
+  hosts: master-1
+  become: yes
+
+  tasks:
+    - name: Install Calico CNI
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for Calico pods to be ready
+      command: kubectl wait --for=condition=ready pod -l k8s-app=calico-node -n kube-system --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Check all pods in kube-system
+      command: kubectl get pods -n kube-system
+      register: kube_system_pods
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Display kube-system pods
+      debug:
+        var: kube_system_pods.stdout

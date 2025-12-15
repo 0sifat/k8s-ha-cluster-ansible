@@ -1,0 +1,55 @@
+---
+- name: Fix network connectivity between masters
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Check current network interfaces
+      shell: ip addr show
+      register: network_interfaces
+
+    - name: Display network interfaces
+      debug:
+        var: network_interfaces.stdout
+
+    - name: Check firewall status
+      shell: ufw status || iptables -L || echo "No firewall found"
+      register: firewall_status
+
+    - name: Display firewall status
+      debug:
+        var: firewall_status.stdout
+
+    - name: Check if etcd ports are blocked
+      shell: |
+        for node in {{ groups.masters | join(' ') }}; do
+          if [[ "$node" != "{{ ansible_default_ipv4.address }}" ]]; then
+            echo "=== Checking etcd ports on $node ==="
+            nc -zv $node 2379
+            nc -zv $node 2380
+            echo ""
+          fi
+        done
+      register: etcd_port_check
+
+    - name: Display etcd port check
+      debug:
+        var: etcd_port_check.stdout
+
+    - name: Disable firewall if enabled (temporary)
+      shell: ufw disable
+      when: "'Status: active' in firewall_status.stdout"
+      ignore_errors: yes
+
+    - name: Allow etcd ports in iptables
+      shell: |
+        iptables -A INPUT -p tcp --dport 2379 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 2380 -j ACCEPT
+        iptables -A OUTPUT -p tcp --dport 2379 -j ACCEPT
+        iptables -A OUTPUT -p tcp --dport 2380 -j ACCEPT
+      ignore_errors: yes
+
+    - name: Restart kubelet to pick up network changes
+      systemd:
+        name: kubelet
+        state: restarted

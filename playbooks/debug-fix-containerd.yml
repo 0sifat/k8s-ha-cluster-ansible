@@ -1,0 +1,130 @@
+---
+- name: Debug and Fix Containerd
+  hosts: master-1
+  become: yes
+  tasks:
+    - name: Check containerd binary
+      shell: |
+        which containerd && containerd --version || echo "NO_CONTAINERD"
+      register: containerd_binary
+      ignore_errors: yes
+
+    - name: Debug containerd binary
+      debug:
+        var: containerd_binary.stdout
+
+    - name: Check current containerd config
+      shell: |
+        cat /etc/containerd/config.toml 2>/dev/null | head -20 || echo "NO_CONFIG"
+      register: current_config
+      ignore_errors: yes
+
+    - name: Debug current config
+      debug:
+        var: current_config.stdout
+
+    - name: Check containerd service status
+      shell: |
+        systemctl status containerd --no-pager -l || echo "SERVICE_NOT_FOUND"
+      register: service_status
+      ignore_errors: yes
+
+    - name: Debug service status
+      debug:
+        var: service_status.stdout
+
+    - name: Check containerd logs
+      shell: |
+        journalctl -u containerd --no-pager -n 10 || echo "NO_LOGS"
+      register: containerd_logs
+      ignore_errors: yes
+
+    - name: Debug containerd logs
+      debug:
+        var: containerd_logs.stdout
+
+    - name: Stop containerd completely
+      shell: |
+        systemctl stop containerd 2>/dev/null || true
+        pkill -f containerd 2>/dev/null || true
+        echo "Containerd stopped"
+      changed_when: false
+
+    - name: Remove all containerd files
+      shell: |
+        rm -rf /etc/containerd /var/lib/containerd /var/run/containerd 2>/dev/null || true
+        echo "Containerd files removed"
+      changed_when: false
+
+    - name: Recreate containerd directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Create simple working containerd config
+      copy:
+        content: |
+          disabled_plugins = []
+          imports = []
+          oom_score = 0
+          plugin_dir = ""
+          required_plugins = []
+          root = "/var/lib/containerd"
+          state = "/run/containerd"
+          version = 2
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              sandbox_image = "registry.k8s.io/pause:3.9"
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                default_runtime_name = "runc"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                  runtime_type = "io.containerd.runc.v2"
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                    SystemdCgroup = true
+            [plugins."io.containerd.internal.v1.restart"]
+              exit_code = 0
+              timeout = "10s"
+          [stream_processors]
+            [stream_processors."io.containerd.ocicrypt.decoder.v1.tar.gzip"]
+              accepts = ["application/vnd.oci.image.layer.v1.tar+gzip+encrypted"]
+              args = ["--decryption-keys-path", "/etc/containerd/ocicrypt/keys"]
+              env = ["OCICRYPT_KEYPROVIDER_CONFIG=/etc/containerd/ocicrypt/ocicrypt_keyprovider.conf"]
+              path = "ctd-decoder"
+              returns = "application/vnd.oci.image.layer.v1.tar"
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Start containerd with new config
+      shell: |
+        systemctl daemon-reload
+        systemctl start containerd
+        systemctl status containerd --no-pager -l
+      register: start_result
+      failed_when: false
+
+    - name: Debug start result
+      debug:
+        var: start_result.stdout
+
+    - name: Wait and test containerd
+      shell: |
+        sleep 3
+        ctr version && echo "SUCCESS" || echo "FAILED"
+      register: test_result
+      ignore_errors: yes
+
+    - name: Debug test result
+      debug:
+        var: test_result.stdout
+
+    - name: Final containerd status
+      shell: |
+        systemctl is-active containerd && echo "ACTIVE" || echo "INACTIVE"
+      register: final_status
+
+    - name: Show final status
+      debug:
+        var: final_status.stdout

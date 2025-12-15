@@ -1,0 +1,198 @@
+---
+- name: Fix containerd configuration for Kubernetes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Check if kubelet service exists
+      systemd:
+        name: kubelet
+      register: kubelet_service
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check if containerd service exists
+      systemd:
+        name: containerd
+      register: containerd_service
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Stop kubelet if it exists
+      systemd:
+        name: kubelet
+        state: stopped
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Stop containerd if it exists
+      systemd:
+        name: containerd
+        state: stopped
+      when: containerd_service.status.ActiveState is defined
+
+    - name: Ensure containerd directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Backup existing containerd config if it exists
+      copy:
+        src: /etc/containerd/config.toml
+        dest: /etc/containerd/config.toml.backup
+        remote_src: yes
+        force: no
+      ignore_errors: yes
+
+    - name: Create proper containerd v2.x configuration
+      copy:
+        content: |
+          version = 2
+
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              sandbox_image = "registry.k8s.io/pause:3.9"
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                default_runtime_name = "runc"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                  runtime_type = "io.containerd.runc.v2"
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                    SystemdCgroup = true
+              [plugins."io.containerd.grpc.v1.cri".cni]
+                bin_dir = "/opt/cni/bin"
+                conf_dir = "/etc/cni/net.d"
+
+          [grpc]
+            address = "/run/containerd/containerd.sock"
+
+          [metrics]
+            address = "127.0.0.1:1338"
+
+          [debug]
+            address = "127.0.0.1:1339"
+            level = "info"
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Remove old containerd socket
+      file:
+        path: /run/containerd/containerd.sock
+        state: absent
+      ignore_errors: yes
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for containerd to be ready
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 30
+
+    - name: Test containerd CRI functionality
+      shell: |
+        ctr version && echo "SUCCESS: Containerd CRI working" || echo "FAILED: Containerd CRI not working"
+      register: containerd_test
+      ignore_errors: yes
+
+    - name: Debug containerd test result
+      debug:
+        var: containerd_test.stdout
+
+    - name: Check if crictl is already installed
+      shell: |
+        which crictl >/dev/null 2>&1 && echo "INSTALLED" || echo "NOT_INSTALLED"
+      register: crictl_check
+      ignore_errors: yes
+
+    - name: Debug crictl check
+      debug:
+        var: crictl_check.stdout
+
+    - name: Download crictl if not installed
+      get_url:
+        url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.0/crictl-v1.30.0-linux-amd64.tar.gz"
+        dest: /tmp/crictl-v1.30.0-linux-amd64.tar.gz
+        mode: '0755'
+      when: crictl_check.stdout == "NOT_INSTALLED"
+
+    - name: Extract crictl if not installed
+      unarchive:
+        src: /tmp/crictl-v1.30.0-linux-amd64.tar.gz
+        dest: /usr/local/bin
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0755'
+      when: crictl_check.stdout == "NOT_INSTALLED"
+
+    - name: Create crictl config
+      copy:
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+          pull-image-on-create: true
+        dest: /etc/crictl.yaml
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Test crictl
+      shell: |
+        crictl version
+      register: crictl_test
+      ignore_errors: yes
+
+    - name: Debug crictl test
+      debug:
+        var: crictl_test.stdout
+
+    - name: Start kubelet if it exists
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Wait for kubelet to initialize
+      pause:
+        seconds: 10
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Check kubelet status if it exists
+      systemd:
+        name: kubelet
+      register: kubelet_status
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Debug kubelet status
+      debug:
+        var: kubelet_status
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Check kubelet logs for errors if kubelet exists
+      shell: |
+        journalctl -u kubelet --no-pager -n 10 | grep -E "(ERROR|FAILED|failed)" || echo "No kubelet errors found"
+      register: kubelet_logs
+      ignore_errors: yes
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Debug kubelet logs
+      debug:
+        var: kubelet_logs.stdout
+      when: kubelet_service.status.ActiveState is defined
+
+    - name: Final status
+      debug:
+        msg: |
+          Node: {{ inventory_hostname }}
+          Containerd: {{ containerd_test.stdout }}
+          Kubelet installed: {{ kubelet_service.status.ActiveState is defined }}
+          Kubelet status: {{ kubelet_status.status.ActiveState | default('NOT_INSTALLED') }}
+          Errors: {{ kubelet_logs.stdout | default('N/A') }}

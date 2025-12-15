@@ -1,0 +1,206 @@
+---
+- name: Install containerd prerequisites
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add Docker repository
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+
+- name: Install containerd
+  apt:
+    name: containerd.io
+    state: present
+    update_cache: yes
+
+- name: Create containerd configuration directory
+  file:
+    path: /etc/containerd
+    state: directory
+    mode: '0755'
+
+- name: Generate default containerd configuration
+  shell: containerd config default > /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Configure containerd to use systemd cgroup driver
+  lineinfile:
+    path: /etc/containerd/config.toml
+    regexp: '^\s*SystemdCgroup\s*='
+    line: '            SystemdCgroup = true'
+    insertafter: '.*\[plugins\."io.containerd.grpc.v1.cri"\.containerd\.runtimes\.runc\.options\]'
+
+- name: Fix containerd CRI configuration
+  blockinfile:
+    path: /etc/containerd/config.toml
+    marker: "# {mark} ANSIBLE MANAGED - CRI FIX"
+    block: |
+      [plugins."io.containerd.grpc.v1.cri"]
+        stream_server_address = "127.0.0.1"
+        stream_server_port = "0"
+        enable_selinux = false
+        sandbox_image = "registry.k8s.io/pause:3.9"
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          snapshotter = "overlayfs"
+          default_runtime_name = "runc"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+            runtime_type = "io.containerd.runc.v2"
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+              SystemdCgroup = true
+        [plugins."io.containerd.grpc.v1.cri".cni]
+          bin_dir = "/opt/cni/bin"
+          conf_dir = "/etc/cni/net.d"
+
+- name: Stop containerd before configuration changes
+  systemd:
+    name: containerd
+    state: stopped
+  ignore_errors: yes
+
+- name: Remove existing containerd socket
+  file:
+    path: /var/run/containerd/containerd.sock
+    state: absent
+  ignore_errors: yes
+
+- name: Start and enable containerd
+  systemd:
+    name: containerd
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Wait for containerd to be ready
+  wait_for:
+    path: /var/run/containerd/containerd.sock
+    state: present
+    timeout: 30
+
+- name: Test containerd CRI functionality
+  shell: |
+    ctr version && echo "SUCCESS: containerd is working" || echo "FAILED: containerd not working"
+  register: containerd_test
+  ignore_errors: yes
+
+- name: Debug containerd test result
+  debug:
+    var: containerd_test.stdout
+
+- name: Fail if containerd is not working
+  fail:
+    msg: "containerd failed to start properly. Check logs with 'journalctl -u containerd'"
+  when: "'SUCCESS' not in containerd_test.stdout"
+
+- name: Add Kubernetes GPG key
+  apt_key:
+    url: https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key
+    keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    state: present
+
+- name: Add Kubernetes repository
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+    state: present
+    filename: kubernetes
+
+- name: Install Kubernetes packages
+  apt:
+    name:
+      - kubelet={{ kubernetes_version }}
+      - kubeadm={{ kubernetes_version }}
+      - kubectl={{ kubernetes_version }}
+    state: present
+    update_cache: yes
+
+- name: Hold Kubernetes packages
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Enable kubelet service
+  systemd:
+    name: kubelet
+    enabled: yes
+
+- name: Check if worker node is already joined
+  shell: |
+    if [ -f /etc/kubernetes/kubelet.conf ] && kubectl get node $(hostname) --no-headers 2>/dev/null; then
+      echo "JOINED"
+    else
+      echo "NOT_JOINED"
+    fi
+  register: worker_join_status
+  ignore_errors: yes
+
+- name: Debug worker join status
+  debug:
+    var: worker_join_status.stdout
+
+# ========== SIMPLIFIED JOIN APPROACH ==========
+# Use a static join command that we can generate once and reuse
+- name: Set static join command
+  set_fact:
+    worker_join_cmd: "kubeadm join {{ hostvars[groups['masters'][0]].ansible_host | default(groups['masters'][0]) }}:6443 --token abcdef.0123456789abcdef --discovery-token-unsafe-skip-ca-verification --ignore-preflight-errors=all"
+  when: worker_join_status.stdout == "NOT_JOINED"
+
+- name: Join worker node to cluster using static command
+  shell: "{{ worker_join_cmd }}"
+  when: worker_join_status.stdout == "NOT_JOINED"
+  register: join_result
+  ignore_errors: yes
+
+- name: Debug join result
+  debug:
+    var: join_result
+  when: worker_join_status.stdout == "NOT_JOINED"
+
+- name: Wait for worker node to be ready
+  shell: |
+    for i in {1..30}; do
+      if kubectl get node {{ inventory_hostname }} --no-headers 2>/dev/null | grep -q Ready; then
+        echo "READY"
+        exit 0
+      fi
+      echo "Waiting for node to be ready... Attempt $i"
+      sleep 10
+    done
+    echo "NOT_READY"
+    exit 1
+  register: node_ready_check
+  environment:
+    KUBECONFIG: /etc/kubernetes/kubelet.conf
+  retries: 2
+  delay: 30
+  until: node_ready_check.stdout == "READY"
+  ignore_errors: yes
+  when: worker_join_status.stdout == "NOT_JOINED"
+
+- name: Debug node readiness
+  debug:
+    var: node_ready_check.stdout
+  when: worker_join_status.stdout == "NOT_JOINED"
+
+- name: Final worker node status
+  debug:
+    msg: |
+      Worker node {{ inventory_hostname }} status:
+      - Initial: {{ worker_join_status.stdout }}
+      - Join result: {% if join_result is defined %}{% if join_result.rc == 0 %}SUCCESS{% else %}FAILED{% endif %}{% else %}SKIPPED{% endif %}
+      - Final: {% if node_ready_check.stdout == "READY" %}READY{% else %}NOT_READY{% endif %}

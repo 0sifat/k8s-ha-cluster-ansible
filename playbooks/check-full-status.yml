@@ -1,0 +1,35 @@
+---
+- name: Check full cluster status
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Get all pods status
+      command: kubectl get pods -A
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: all_pods
+
+    - name: Display all pods
+      debug:
+        var: all_pods.stdout
+
+    - name: Get node status
+      command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes
+
+    - name: Display nodes
+      debug:
+        var: nodes.stdout
+
+    - name: Check if we can access the API
+      command: kubectl get ns
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api_access
+
+    - name: Display API access
+      debug:
+        var: api_access.stdout

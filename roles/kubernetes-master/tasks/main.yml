@@ -1,0 +1,519 @@
+---
+# roles/kubernetes-master/tasks/main.yml
+
+- name: Install containerd prerequisites
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+
+# ========== CHECK CURRENT STATE BEFORE PROCEEDING ==========
+- name: Check if containerd is already running
+  systemd:
+    name: containerd
+  register: containerd_status
+  changed_when: false
+  ignore_errors: yes
+
+- name: Check if Kubernetes cluster is already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: k8s_initialized
+  changed_when: false
+
+- name: Debug current state
+  debug:
+    msg: |
+      Containerd status: {{ containerd_status.status.ActiveState if containerd_status is succeeded else 'Unknown' }}
+      Kubernetes initialized: {{ k8s_initialized.stat.exists }}
+      Hostname: {{ inventory_hostname }}
+
+# ========== CLEAN UP OLD DOCKER CONFIGURATION (Only if needed) ==========
+- name: Remove old Docker repository configuration
+  shell: |
+    # Remove any existing Docker repository files
+    rm -f /etc/apt/sources.list.d/docker*.list
+    # Remove Docker key from trusted.gpg.d if exists
+    rm -f /etc/apt/trusted.gpg.d/docker*.gpg
+  ignore_errors: yes
+  changed_when: false
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Update apt cache after cleaning
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Create keyrings directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+# ========== DOCKER/CONTAINERD SETUP (Only if containerd not running) ==========
+- name: Add Docker GPG key (modern method)
+  shell: |
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Add Docker repository (modern method)
+  apt_repository:
+    repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    filename: docker-ce
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Install containerd
+  apt:
+    name: containerd.io
+    state: present
+    update_cache: yes
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Configure containerd (only if not already running with config)
+  block:
+    - name: Create containerd configuration directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+    
+    - name: Check if containerd config exists
+      stat:
+        path: /etc/containerd/config.toml
+      register: containerd_config_exists
+    
+    - name: Generate default containerd configuration if missing
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+      when: not containerd_config_exists.stat.exists
+    
+    - name: Configure containerd to use systemd cgroup driver
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^\s*SystemdCgroup\s*='
+        line: '            SystemdCgroup = true'
+        insertafter: '.*\[plugins\."io.containerd.grpc.v1.cri"\.containerd\.runtimes\.runc\.options\]'
+      when: not containerd_config_exists.stat.exists
+    
+    - name: Fix containerd CRI configuration
+      blockinfile:
+        path: /etc/containerd/config.toml
+        marker: "# {mark} ANSIBLE MANAGED - CRI FIX"
+        block: |
+          [plugins."io.containerd.grpc.v1.cri"]
+            stream_server_address = "127.0.0.1"
+            stream_server_port = "0"
+            enable_selinux = false
+            sandbox_image = "registry.k8s.io/pause:3.9"
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              snapshotter = "overlayfs"
+              default_runtime_name = "runc"
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                runtime_type = "io.containerd.runc.v2"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                  SystemdCgroup = true
+            [plugins."io.containerd.grpc-v1.cri".cni]
+              bin_dir = "/opt/cni/bin"
+              conf_dir = "/etc/cni/net.d"
+      when: not containerd_config_exists.stat.exists
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+# ========== MANAGE CONTAINERD SERVICE ==========
+- name: Ensure containerd is stopped before reconfiguration (only if not active with containers)
+  systemd:
+    name: containerd
+    state: stopped
+  ignore_errors: yes
+  when: (not containerd_status is succeeded or containerd_status.status.ActiveState != 'active') and not k8s_initialized.stat.exists
+
+- name: Remove existing containerd socket (only if safe)
+  file:
+    path: /var/run/containerd/containerd.sock
+    state: absent
+  ignore_errors: yes
+  when: (not containerd_status is succeeded or containerd_status.status.ActiveState != 'active') and not k8s_initialized.stat.exists
+
+- name: Start and enable containerd (only if not already running)
+  systemd:
+    name: containerd
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Wait for containerd to be ready (only if we started it)
+  wait_for:
+    path: /var/run/containerd/containerd.sock
+    state: present
+    timeout: 30
+  when: not containerd_status is succeeded or containerd_status.status.ActiveState != 'active'
+
+- name: Test containerd CRI functionality
+  shell: |
+    ctr version && echo "SUCCESS: containerd is working" || echo "FAILED: containerd not working"
+  register: containerd_test
+  ignore_errors: yes
+
+- name: Debug containerd test result
+  debug:
+    var: containerd_test.stdout
+
+# ========== CLEAN UP OLD KUBERNETES CONFIGURATION ==========
+- name: Remove old Kubernetes repository configuration
+  shell: |
+    # Remove any existing Kubernetes repository files
+    rm -f /etc/apt/sources.list.d/kubernetes*.list
+    # Remove Kubernetes key from trusted.gpg.d if exists
+    rm -f /etc/apt/trusted.gpg.d/kubernetes*.gpg
+  ignore_errors: yes
+  changed_when: false
+
+# ========== KUBERNETES SETUP WITH VERSION 1.30.2 ==========
+- name: Add Kubernetes GPG key for 1.30
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes repository for 1.30
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
+    state: present
+    filename: kubernetes
+
+- name: Update apt cache for Kubernetes
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+# ========== SET KUBERNETES VERSION FROM INVENTORY ==========
+- name: Set Kubernetes version from inventory
+  set_fact:
+    kubernetes_version: "{{ k8s_version | default('1.30.2') }}-1.1"
+
+- name: Debug final Kubernetes version
+  debug:
+    msg: "Using Kubernetes version: {{ kubernetes_version }}"
+
+# ========== FIX FOR HELD PACKAGES ==========
+- name: Check if Kubernetes packages are held
+  shell: |
+    dpkg-query -W -f='${Package} ${Status}\n' kubelet kubeadm kubectl 2>/dev/null | grep hold || echo "NOT_HELD"
+  register: held_packages_check
+  ignore_errors: yes
+
+- name: Debug held packages status
+  debug:
+    var: held_packages_check.stdout
+
+- name: Unhold Kubernetes packages if they are held
+  shell: |
+    apt-mark unhold kubelet kubeadm kubectl
+  when: "'hold' in held_packages_check.stdout"
+  ignore_errors: yes
+
+- name: Install Kubernetes packages
+  apt:
+    name:
+      - kubelet={{ kubernetes_version }}
+      - kubeadm={{ kubernetes_version }}
+      - kubectl={{ kubernetes_version }}
+    state: present
+    update_cache: yes
+    allow_change_held_packages: yes
+
+# ========== FIX KUBELET CONFIGURATION ISSUE ==========
+- name: Ensure kubelet config directory exists
+  file:
+    path: /var/lib/kubelet
+    state: directory
+    mode: '0755'
+
+- name: Create kubelet environment file
+  copy:
+    dest: /var/lib/kubelet/kubeadm-flags.env
+    content: |
+      KUBELET_KUBEADM_ARGS="--container-runtime=remote --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Hold Kubernetes packages
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Enable kubelet service
+  systemd:
+    name: kubelet
+    enabled: yes
+
+- name: Start kubelet service (only if cluster not initialized)
+  systemd:
+    name: kubelet
+    state: started
+  when: not k8s_initialized.stat.exists
+
+# ========== CHECK KUBELET STATUS BEFORE INIT ==========
+- name: Check kubelet status before cluster init
+  systemd:
+    name: kubelet
+  register: kubelet_status_before
+  ignore_errors: yes
+
+- name: Debug kubelet status before init
+  debug:
+    var: kubelet_status_before
+
+# ========== CLUSTER INITIALIZATION BLOCK ==========
+- name: Initialize Kubernetes cluster if not already initialized
+  block:
+    - name: Create kubeadm config file for first master
+      template:
+        src: kubeadm-config.yaml.j2
+        dest: /tmp/kubeadm-config.yaml
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Initialize Kubernetes cluster on first master
+      shell: |
+        kubeadm init --config=/tmp/kubeadm-config.yaml --upload-certs --ignore-preflight-errors=all
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      retries: 2
+      delay: 30
+      until: kubeadm_init.rc == 0
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Debug kubeadm init result
+      debug:
+        var: kubeadm_init
+      when: inventory_hostname == groups['masters'][0] and kubeadm_init is defined
+
+    - name: Setup kubeconfig for root user
+      block:
+        - name: Create .kube directory
+          file:
+            path: /root/.kube
+            state: directory
+            mode: '0755'
+        
+        - name: Copy admin config
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0600'
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Wait for kubelet to stabilize after cluster init
+      pause:
+        seconds: 60
+      when: inventory_hostname == groups['masters'][0]
+
+    # ========== CHECK SYSTEM PODS ==========
+    - name: Check if system pods are running
+      shell: |
+        # Wait for kube-system pods to appear
+        for i in $(seq 1 30); do
+          if [ -d "/etc/kubernetes/manifests" ] && [ "$(ls -1 /etc/kubernetes/manifests/ 2>/dev/null | wc -l)" -gt 0 ]; then
+            echo "System pods manifests found"
+            exit 0
+          fi
+          echo "Waiting for system pods... $i/30"
+          sleep 5
+        done
+        echo "No system pods found after 150 seconds"
+        exit 1
+      args:
+        executable: /bin/bash
+      when: inventory_hostname == groups['masters'][0]
+      register: system_pods_check
+      ignore_errors: yes
+
+    - name: Check for running containers
+      shell: |
+        crictl ps 2>/dev/null || echo "No containers running"
+      when: inventory_hostname == groups['masters'][0]
+      register: running_containers
+      ignore_errors: yes
+
+    - name: Debug running containers
+      debug:
+        var: running_containers.stdout
+      when: inventory_hostname == groups['masters'][0]
+
+    # ========== WAIT FOR API SERVER WITH SIMPLE LOOP ==========
+    - name: Wait for API server to be accessible
+      shell: |
+        # Try for up to 5 minutes
+        for i in $(seq 1 60); do
+          # Check if API server process is running
+          if pgrep -f "kube-apiserver" > /dev/null; then
+            echo "API server process is running"
+            # Now check if we can connect
+            if timeout 5 kubectl cluster-info --request-timeout=5s 2>/dev/null; then
+              echo "API server is responding"
+              exit 0
+            fi
+          fi
+          echo "Waiting for API server... attempt $i/60"
+          sleep 5
+        done
+        echo "API server not accessible after 300 seconds"
+        exit 1
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname == groups['masters'][0]
+      register: api_server_check
+      retries: 2
+      delay: 30
+      ignore_errors: yes
+
+    # ========== INSTALL CALICO SIMPLIFIED ==========
+    - name: Check if we can install Calico
+      shell: |
+        # First check if API server is minimally responsive
+        if timeout 10 kubectl get nodes 2>/dev/null; then
+          echo "API server is responsive, can install Calico"
+          exit 0
+        else
+          echo "API server not yet ready for Calico"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname == groups['masters'][0]
+      register: calico_precheck
+      ignore_errors: yes
+
+    - name: Install Calico CNI plugin
+      shell: |
+        # Try multiple times to install Calico
+        for attempt in 1 2 3 4 5; do
+          echo "Attempt $attempt to install Calico..."
+          if kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml --validate=false; then
+            echo "Calico installed successfully"
+            exit 0
+          fi
+          echo "Calico installation attempt $attempt failed, waiting 15 seconds..."
+          sleep 15
+        done
+        echo "Failed to install Calico after 5 attempts"
+        exit 1
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname == groups['masters'][0] and calico_precheck.rc == 0
+      register: calico_install
+      ignore_errors: yes
+
+    - name: Debug Calico installation
+      debug:
+        var: calico_install
+      when: inventory_hostname == groups['masters'][0]
+
+  when: not k8s_initialized.stat.exists and inventory_hostname == groups['masters'][0]
+
+# ========== POST-INITIALIZATION CHECKS ==========
+- name: Final cluster verification
+  block:
+    - name: Check if cluster is accessible
+      shell: |
+        kubectl get nodes 2>/dev/null && echo "CLUSTER_ACCESSIBLE" || echo "CLUSTER_INACCESSIBLE"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname == groups['masters'][0]
+      register: cluster_access
+      ignore_errors: yes
+
+    - name: Display cluster status
+      debug:
+        msg: |
+          Kubernetes cluster status on {{ inventory_hostname }}:
+          - Cluster initialized: {{ k8s_initialized.stat.exists }}
+          - API server accessible: {{ cluster_access.stdout }}
+          - Kubelet running: {{ kubelet_status_before.status.ActiveState if kubelet_status_before is defined else 'Unknown' }}
+          - Containerd running: {{ containerd_status.status.ActiveState if containerd_status is succeeded else 'Unknown' }}
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Collect troubleshooting information if cluster failed
+      block:
+        - name: Check kubelet logs
+          shell: |
+            journalctl -u kubelet -n 30 --no-pager
+          register: kubelet_logs
+          ignore_errors: yes
+
+        - name: Check containerd status
+          shell: |
+            systemctl status containerd --no-pager
+          register: containerd_status_final
+          ignore_errors: yes
+
+        - name: Check for any k8s manifests
+          shell: |
+            ls -la /etc/kubernetes/manifests/ 2>/dev/null || echo "No manifests directory"
+          register: manifests
+          ignore_errors: yes
+
+        - name: Display troubleshooting info
+          debug:
+            msg: |
+              TROUBLESHOOTING INFO:
+              - Kubelet logs (last 30 lines): {{ kubelet_logs.stdout_lines | default([]) | join('\n') }}
+              - Containerd status: {{ containerd_status_final.stdout_lines | default([]) | join('\n') }}
+              - K8s manifests: {{ manifests.stdout }}
+          when: inventory_hostname == groups['masters'][0] and cluster_access.stdout == "CLUSTER_INACCESSIBLE"
+      
+      when: inventory_hostname == groups['masters'][0] and cluster_access.stdout == "CLUSTER_INACCESSIBLE"
+
+# ========== SETUP FOR OTHER MASTERS (Join command) ==========
+- name: Generate join command for other masters
+  shell: |
+    kubeadm token create --print-join-command
+  register: join_command
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: inventory_hostname == groups['masters'][0] and k8s_initialized.stat.exists
+
+- name: Generate certificate key for control plane join
+  shell: |
+    kubeadm init phase upload-certs --upload-certs 2>/dev/null | grep -oP 'certificate key:\s*\K.*'
+  register: cert_key
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: inventory_hostname == groups['masters'][0] and k8s_initialized.stat.exists
+
+- name: Display join information
+  debug:
+    msg: |
+      Join Token Command: {{ join_command.stdout }}
+      Certificate Key: {{ cert_key.stdout }}
+  when: inventory_hostname == groups['masters'][0] and k8s_initialized.stat.exists

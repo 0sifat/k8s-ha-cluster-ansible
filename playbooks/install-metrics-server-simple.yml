@@ -1,0 +1,56 @@
+---
+- name: Install Metrics Server (Simple Version)
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Delete existing metrics-server
+      command: kubectl delete -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml --ignore-not-found=true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for cleanup
+      pause:
+        seconds: 10
+
+    - name: Copy metrics-server manifest
+      copy:
+        src: files/metrics-server.yaml
+        dest: /tmp/metrics-server.yaml
+
+    - name: Apply metrics-server
+      command: kubectl apply -f /tmp/metrics-server.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for metrics-server to be ready
+      command: kubectl wait --for=condition=available deployment/metrics-server -n kube-system --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Check metrics-server status
+      command: kubectl get pods -n kube-system -l k8s-app=metrics-server
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: metrics_status
+
+    - name: Display metrics-server status
+      debug:
+        var: metrics_status.stdout
+
+    - name: Wait for metrics collection
+      pause:
+        seconds: 30
+
+    - name: Test metrics
+      command: kubectl top nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: top_result
+      ignore_errors: yes
+
+    - name: Display metrics result
+      debug:
+        var: top_result.stdout
+      when: top_result.rc == 0

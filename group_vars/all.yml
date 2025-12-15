@@ -1,0 +1,93 @@
+# Kubernetes Version
+k8s_version: "1.30.2"
+pause_image: "registry.k8s.io/pause:3.9"
+cgroup_driver: "systemd"
+container_runtime: "containerd"
+
+# Container Runtime
+containerd_version: "1.7.2"
+
+# Network Configuration
+pod_network_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+cluster_dns: "10.96.0.10"
+
+# Load Balancer Configuration
+load_balancer_ip: "3.109.32.81"
+load_balancer_port: 6443
+
+# Cluster Configuration
+cluster_name: "k8s-ha-cluster"
+control_plane_endpoint: "{{ load_balancer_ip }}:{{ load_balancer_port }}"
+
+# Certificate Key (will be generated during cluster init)
+certificate_key: ""
+
+# Calico Configuration
+calico_version: "v3.26.1"
+
+# System Settings
+swap_disable: true
+selinux_disable: true
+firewall_disable: true
+
+# Kernel Modules
+kernel_modules:
+  - overlay
+  - br_netfilter
+
+# Sysctl Parameters
+sysctl_config:
+  net.bridge.bridge-nf-call-iptables: 1
+  net.bridge.bridge-nf-call-ip6tables: 1
+  net.ipv4.ip_forward: 1
+
+# Packages to install
+common_packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - software-properties-common
+  - vim
+  - wget
+  - git
+  - net-tools
+  - nfs-common
+  - ipvsadm
+  - ipset
+
+# API Server timeout settings
+api_server_timeout: 300
+
+# Kubelet settings
+kubelet_max_pods: 110
+
+# etcd settings (helps with stability)
+etcd_quota_backend_bytes: 2147483648  # 2GB
+
+# Control Plane Stability Settings
+api_server_startup_probe:
+  enabled: true
+  initial_delay_seconds: 30
+  period_seconds: 10
+  failure_threshold: 30
+  timeout_seconds: 15
+
+# Resource limits for control plane components
+control_plane_resources:
+  api_server:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  etcd:
+    requests:
+      cpu: "100m"
+      memory: "100Mi"
+    limits:
+      cpu: "200m"
+      memory: "512Mi"

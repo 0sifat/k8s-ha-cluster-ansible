@@ -1,0 +1,85 @@
+---
+- name: Fix containerd version mismatch
+  hosts: masters[1:]  # master-2 and master-3
+  become: yes
+
+  tasks:
+    - name: Check current containerd version
+      command: containerd --version
+      register: containerd_version
+
+    - name: Display current containerd version
+      debug:
+        var: containerd_version.stdout
+
+    - name: Stop kubelet
+      systemd:
+        name: kubelet
+        state: stopped
+
+    - name: Stop containerd
+      systemd:
+        name: containerd
+        state: stopped
+
+    - name: Remove old containerd
+      apt:
+        name: containerd
+        state: absent
+
+    - name: Install latest containerd
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate containerd config
+      command: containerd config default
+      register: containerd_config
+
+    - name: Save containerd config
+      copy:
+        content: "{{ containerd_config.stdout }}"
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+
+    - name: Enable systemd cgroup in containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '            SystemdCgroup = false'
+        replace: '            SystemdCgroup = true'
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for containerd socket
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        timeout: 30
+
+    - name: Verify new containerd version
+      command: containerd --version
+      register: new_containerd_version
+
+    - name: Display new containerd version
+      debug:
+        var: new_containerd_version.stdout
+
+    - name: Start kubelet
+      systemd:
+        name: kubelet
+        state: started
+
+    - name: Wait for kubelet to stabilize
+      pause:
+        seconds: 30

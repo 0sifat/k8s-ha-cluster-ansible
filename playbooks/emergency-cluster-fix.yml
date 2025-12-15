@@ -1,0 +1,53 @@
+---
+- name: Emergency cluster recovery
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Check system resources
+      shell: |
+        echo "=== Memory ==="
+        free -h
+        echo "=== Disk ==="  
+        df -h
+        echo "=== Docker ==="
+        docker ps | wc -l
+      register: resources
+
+    - name: Display resources
+      debug:
+        var: resources.stdout
+
+    - name: Restart kubelet on all masters
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: Wait for kubelet to stabilize
+      pause:
+        seconds: 30
+
+- name: Fix from master-1 perspective
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Delete all crashing control plane pods
+      command: kubectl delete pod -n kube-system --field-selector=status.phase!=Running
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Wait for pods to restart
+      pause:
+        seconds: 60
+
+    - name: Check current status
+      command: kubectl get pods -A
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: status
+
+    - name: Display status
+      debug:
+        var: status.stdout

@@ -1,0 +1,35 @@
+---
+- name: Check network connectivity between nodes
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Check connectivity to other masters
+      shell: |
+        for node in {{ groups.masters | join(' ') }}; do
+          if [[ "$node" != "{{ inventory_hostname }}" ]]; then
+            echo "Checking connectivity to $node"
+            ping -c 3 $node
+            echo "---"
+          fi
+        done
+      register: ping_results
+
+    - name: Display ping results
+      debug:
+        var: ping_results.stdout
+
+    - name: Check if API server ports are accessible
+      shell: |
+        for node in {{ groups.masters | join(' ') }}; do
+          if [[ "$node" != "{{ inventory_hostname }}" ]]; then
+            echo "Checking port 6443 on $node"
+            nc -zv $node 6443
+            echo "---"
+          fi
+        done
+      register: port_results
+
+    - name: Display port check results
+      debug:
+        var: port_results.stdout

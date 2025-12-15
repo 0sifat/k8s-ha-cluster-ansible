@@ -1,0 +1,118 @@
+---
+- name: Stop all containers and upgrade containerd
+  hosts: masters[1:]  # master-2 and master-3
+  become: yes
+
+  tasks:
+    - name: Stop kubelet first
+      systemd:
+        name: kubelet
+        state: stopped
+
+    - name: Stop all running containers
+      shell: |
+        # Stop all Docker containers if any
+        docker stop $(docker ps -q) 2>/dev/null || true
+        # Stop all containerd containers
+        crictl stopp $(crictl pods -q) 2>/dev/null || true
+        crictl rmp $(crictl pods -q) 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Stop containerd service
+      systemd:
+        name: containerd
+        state: stopped
+
+    - name: Kill any remaining containerd processes
+      shell: |
+        pkill -f containerd || true
+        sleep 2
+      ignore_errors: yes
+
+    - name: Force unmount any containerd mounts
+      shell: |
+        umount /var/lib/containerd/* 2>/dev/null || true
+        umount /run/containerd/* 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Remove containerd packages
+      apt:
+        name: 
+          - containerd
+          - docker.io
+          - docker-ce
+        state: absent
+        purge: yes
+        force: yes
+      ignore_errors: yes
+
+    - name: Remove containerd directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/containerd
+        - /var/lib/containerd
+        - /run/containerd
+        - /var/run/containerd
+      ignore_errors: yes
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+
+    - name: Install latest containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate containerd config
+      command: containerd config default
+      register: containerd_config
+
+    - name: Save containerd config
+      copy:
+        content: "{{ containerd_config.stdout }}"
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+
+    - name: Enable systemd cgroup in containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '            SystemdCgroup = false'
+        replace: '            SystemdCgroup = true'
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for containerd socket
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        timeout: 30
+
+    - name: Verify containerd version
+      command: containerd --version
+      register: containerd_ver
+
+    - name: Display containerd version
+      debug:
+        var: containerd_ver.stdout
+
+    - name: Start kubelet
+      systemd:
+        name: kubelet
+        state: started
+
+    - name: Wait for kubelet to stabilize
+      pause:
+        seconds: 60

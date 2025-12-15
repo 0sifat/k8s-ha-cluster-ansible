@@ -1,0 +1,185 @@
+---
+- name: Reset and Reinitialize First Master
+  hosts: master-1
+  become: yes
+  vars:
+    # Define variables directly in the playbook
+    k8s_version: "1.30.2"
+    load_balancer_ip: "3.109.32.81"
+    load_balancer_port: 6443
+    control_plane_endpoint: "{{ load_balancer_ip }}:{{ load_balancer_port }}"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+
+  tasks:
+    - name: Reset kubeadm completely
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove kubeadm configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet
+        - /etc/cni/net.d
+        - /root/.kube
+      ignore_errors: yes
+
+    - name: Clean iptables (fixed syntax)
+      shell: |
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+      ignore_errors: yes
+
+    - name: Clean ipvs
+      command: ipvsadm --clear
+      ignore_errors: yes
+
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Stop containerd
+      systemd:
+        name: containerd
+        state: stopped
+
+    - name: Remove containerd config
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+      ignore_errors: yes
+
+    - name: Create containerd directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate new containerd config (fixed)
+      command: containerd config default
+      register: containerd_config
+      changed_when: false
+
+    - name: Save containerd config to file
+      copy:
+        content: "{{ containerd_config.stdout }}"
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+
+    - name: Enable systemd cgroup in containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '            SystemdCgroup = false'
+        replace: '            SystemdCgroup = true'
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Wait for containerd to be ready
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        timeout: 30
+
+    - name: Create improved kubeadm config
+      copy:
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: "{{ ansible_default_ipv4.address }}"
+            bindPort: 6443
+          nodeRegistration:
+            criSocket: "unix:///var/run/containerd/containerd.sock"
+            taints: []
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: v{{ k8s_version }}
+          controlPlaneEndpoint: "{{ control_plane_endpoint }}"
+          networking:
+            podSubnet: "{{ pod_network_cidr }}"
+            serviceSubnet: "{{ service_cidr }}"
+          apiServer:
+            extraArgs:
+              advertise-address: "{{ ansible_default_ipv4.address }}"
+        dest: /root/kubeadm-config.yaml
+
+    - name: Initialize Kubernetes cluster with kubeadm
+      command: kubeadm init --config /root/kubeadm-config.yaml --upload-certs
+      async: 1200
+      poll: 30
+
+    - name: Wait for kubelet to start
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Wait for API server to be ready
+      wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        delay: 10
+        timeout: 300
+
+    - name: Create .kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Setup kubectl for root user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Create .kube directory for current user
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        mode: '0700'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Setup kubectl for current user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+
+    - name: Check cluster status
+      command: kubectl get nodes
+      register: cluster_status
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Display cluster status
+      debug:
+        var: cluster_status.stdout
+
+    - name: Display join command for other nodes
+      command: kubeadm token create --print-join-command
+      register: join_command
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Show join command
+      debug:
+        var: join_command.stdout

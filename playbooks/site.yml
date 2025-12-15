@@ -1,0 +1,40 @@
+---
+# Complete Kubernetes HA Cluster Setup
+- name: Setup common configurations on all nodes
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - common
+
+- name: Setup HAProxy LoadBalancer
+  hosts: loadbalancer
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - haproxy
+
+- name: Initialize first Kubernetes master
+  hosts: masters[0]
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - kubernetes-master
+
+- name: Join additional master nodes
+  import_playbook: join-additional-masters.yml
+
+- name: Setup worker nodes
+  hosts: workers
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../group_vars/all.yml
+  roles:
+    - kubernetes-worker

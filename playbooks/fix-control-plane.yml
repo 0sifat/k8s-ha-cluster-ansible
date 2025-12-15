@@ -1,0 +1,39 @@
+---
+- name: Fix control plane components
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Check failing API server logs
+      command: kubectl logs -n kube-system -l component=kube-apiserver --tail=50
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api_logs
+      ignore_errors: yes
+      delegate_to: "{{ groups.masters[0] }}"
+
+    - name: Display API server logs
+      debug:
+        var: api_logs.stdout
+
+    - name: Restart all control plane components
+      command: kubectl delete pod -n kube-system -l tier=control-plane
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+      delegate_to: "{{ groups.masters[0] }}"
+
+    - name: Wait for control plane to stabilize
+      pause:
+        seconds: 60
+
+    - name: Check control plane status
+      command: kubectl get pods -n kube-system -l tier=control-plane
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: control_plane_status
+      delegate_to: "{{ groups.masters[0] }}"
+
+    - name: Display control plane status
+      debug:
+        var: control_plane_status.stdout

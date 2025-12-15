@@ -1,0 +1,34 @@
+---
+- name: Install Metrics Server - Simple
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Remove old metrics-server
+      command: kubectl delete -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml --ignore-not-found=true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Install metrics-server with insecure TLS
+      shell: |
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for metrics-server
+      command: kubectl rollout status deployment/metrics-server -n kube-system --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Check final status
+      command: kubectl top nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: final_check
+      ignore_errors: yes
+
+    - name: Show result
+      debug:
+        var: final_check.stdout

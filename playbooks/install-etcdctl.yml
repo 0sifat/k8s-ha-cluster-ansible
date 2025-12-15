@@ -1,0 +1,19 @@
+---
+- name: Install etcdctl on master nodes
+  hosts: masters
+  become: yes
+
+  tasks:
+    - name: Install etcdctl
+      apt:
+        name: etcd-client
+        state: present
+        update_cache: yes
+
+    - name: Verify etcdctl installation
+      command: etcdctl version
+      register: etcdctl_version
+
+    - name: Display etcdctl version
+      debug:
+        var: etcdctl_version.stdout

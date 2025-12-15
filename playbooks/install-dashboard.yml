@@ -1,0 +1,134 @@
+---
+- name: Install Kubernetes Dashboard on all masters
+  hosts: masters
+  become: yes
+  gather_facts: yes
+  vars:
+    dashboard_version: "v2.7.0"
+    dashboard_namespace: "kubernetes-dashboard"
+    token_file_path: "/root/dashboard-token.txt"
+    
+  tasks:
+    - name: Check if Kubernetes cluster is accessible
+      command: kubectl cluster-info --kubeconfig /etc/kubernetes/admin.conf
+      register: cluster_info
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Check if dashboard already exists
+      shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get ns {{ dashboard_namespace }}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: dashboard_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Kubernetes Dashboard (if not exists)
+      shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/{{ dashboard_version }}/aio/deploy/recommended.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: 
+        - cluster_info.rc == 0
+        - dashboard_check.rc != 0
+
+    - name: Create admin service account (if not exists)
+      shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get sa admin-user -n {{ dashboard_namespace }} || kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: admin-user
+          namespace: {{ dashboard_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: cluster_info.rc == 0
+
+    - name: Create cluster role binding (if not exists)
+      shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get clusterrolebinding admin-user || kubectl apply -f - <<EOF
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: admin-user
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: cluster-admin
+        subjects:
+        - kind: ServiceAccount
+          name: admin-user
+          namespace: {{ dashboard_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: cluster_info.rc == 0
+
+    - name: Wait for Kubernetes Dashboard to be ready
+      shell: |
+        timeout 300 bash -c 'until kubectl --kubeconfig /etc/kubernetes/admin.conf -n {{ dashboard_namespace }} get pods -l k8s-app=kubernetes-dashboard -o jsonpath="{.items[0].status.phase}" | grep -q Running; do sleep 10; done'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: wait_result
+      until: wait_result.rc == 0
+      retries: 30
+      delay: 10
+      when: cluster_info.rc == 0
+
+    - name: Create token for admin user (first master only)
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n {{ dashboard_namespace }}
+        create token admin-user
+        --duration=87600h
+      register: dashboard_token
+      retries: 3
+      delay: 5
+      when: 
+        - cluster_info.rc == 0
+        - inventory_hostname == groups['masters'][0]  # Only on first master
+
+    - name: Save token to file (first master only)
+      copy:
+        content: "{{ dashboard_token.stdout }}"
+        dest: "{{ token_file_path }}"
+        mode: 0600
+      when: 
+        - cluster_info.rc == 0
+        - inventory_hostname == groups['masters'][0]
+      notify: Display dashboard access info
+
+    - name: Create NodePort service for dashboard access
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: dashboard-nodeport
+          namespace: {{ dashboard_namespace }}
+        spec:
+          type: NodePort
+          selector:
+            k8s-app: kubernetes-dashboard
+          ports:
+          - port: 443
+            targetPort: 8443
+            nodePort: 30001
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+      when: cluster_info.rc == 0
+
+  handlers:
+    - name: Display dashboard access info
+      debug:
+        msg:
+          - "Kubernetes Dashboard installed successfully on all masters!"
+          - "Dashboard token saved to first master: {{ token_file_path }}"
+          - "Access via any master node IP:"
+          - "  https://<ANY_MASTER_IP>:30001"
+          - "Available master IPs:"
+          - "  {{ groups['masters'] | map('extract', hostvars, 'ansible_host') | list }}"
+          - "Token: {{ dashboard_token.stdout }}"

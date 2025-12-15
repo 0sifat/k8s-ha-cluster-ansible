@@ -1,0 +1,47 @@
+---
+- name: Check etcd cluster status
+  hosts: masters[0]
+  become: yes
+
+  tasks:
+    - name: Check etcd member list from master-1
+      shell: |
+        etcdctl \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          member list -w table
+      register: etcd_members
+
+    - name: Display etcd members
+      debug:
+        var: etcd_members.stdout
+
+    - name: Check etcd cluster health
+      shell: |
+        etcdctl \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          endpoint health -w table
+      register: etcd_health
+
+    - name: Display etcd health
+      debug:
+        var: etcd_health.stdout
+
+    - name: Check etcd cluster status
+      shell: |
+        etcdctl \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          endpoint status -w table
+      register: etcd_status
+
+    - name: Display etcd status
+      debug:
+        var: etcd_status.stdout

@@ -1,0 +1,143 @@
+---
+- name: Join additional master nodes
+  hosts: masters[1:]
+  become: yes
+  
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Configure containerd
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        systemctl restart containerd
+        systemctl enable containerd
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet=1.30.2-1.1
+          - kubeadm=1.30.2-1.1
+          - kubectl=1.30.2-1.1
+        state: present
+
+    - name: Hold Kubernetes packages
+      shell: |
+        apt-mark hold kubelet kubeadm kubectl
+
+    - name: Create kubeadm-flags.env
+      copy:
+        dest: /var/lib/kubelet/kubeadm-flags.env
+        content: |
+          KUBELET_KUBEADM_ARGS="--container-runtime=remote --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+  
+  tasks:
+    - name: Check if node is already joined
+      command: kubectl get nodes {{ inventory_hostname }}
+      delegate_to: master-1
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: node_check
+      ignore_errors: yes
+    
+    - name: Set node joined fact
+      set_fact:
+        node_joined: "{{ node_check.rc == 0 }}"
+    
+    - name: Get join information from master-1
+      delegate_to: master-1
+      run_once: yes
+      block:
+        - name: Create join token
+          command: kubeadm token create --print-join-command
+          register: join_token
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+        
+        - name: Generate certificate key
+          command: openssl rand -hex 32
+          register: generated_cert_key
+        
+        - name: Upload certs with generated key
+          command: kubeadm init phase upload-certs --upload-certs --certificate-key {{ generated_cert_key.stdout }}
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          ignore_errors: yes
+        
+        - name: Set join facts
+          set_fact:
+            join_command: "{{ join_token.stdout }}"
+            certificate_key: "{{ generated_cert_key.stdout }}"
+    
+    - name: Display join information
+      debug:
+        msg: |
+          Join Command: {{ join_command }}
+          Certificate Key: {{ certificate_key }}
+    
+    - name: Join master to cluster
+      command: "{{ join_command }} --control-plane --certificate-key {{ certificate_key }}"
+      when: not node_joined
+      register: join_result
+      ignore_errors: yes
+    
+    - name: Check join result
+      debug:
+        var: join_result
+      when: not node_joined
+    
+    - name: Retry join if failed (with ignore-preflight-errors)
+      command: "{{ join_command }} --control-plane --certificate-key {{ certificate_key }} --ignore-preflight-errors=all"
+      when: not node_joined and join_result.failed
+      register: retry_join
+      ignore_errors: yes
+    
+    - name: Wait for node to be ready
+      command: kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+      delegate_to: master-1
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: not node_joined
+      register: wait_result
+      until: wait_result.rc == 0
+      retries: 10
+      delay: 30
+      ignore_errors: yes
+    
+    - name: Copy admin config
+      shell: |
+        mkdir -p /root/.kube
+        scp master-1:/etc/kubernetes/admin.conf /root/.kube/config
+      when: not node_joined
+      ignore_errors: yes
+    
+    - name: Verify node joined
+      command: kubectl get nodes {{ inventory_hostname }}
+      delegate_to: master-1
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: node_check_final
+      ignore_errors: yes
+    
+    - name: Display success message
+      debug:
+        msg: "Node {{ inventory_hostname }} successfully joined the cluster!"
+      when: node_check_final.rc == 0

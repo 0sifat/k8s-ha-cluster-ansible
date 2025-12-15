@@ -1,0 +1,39 @@
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version }}
+clusterName: {{ cluster_name }}
+controlPlaneEndpoint: "{{ lb_vip }}:{{ lb_port }}"
+networking:
+  podSubnet: {{ pod_network_cidr }}
+  serviceSubnet: {{ service_cidr }}
+apiServer:
+  certSANs:
+    - "{{ lb_vip }}"
+    - "127.0.0.1"
+    - "localhost"
+{% for host in groups['masters'] %}
+    - "{{ hostvars[host].ansible_host }}"
+    - "{{ host }}"
+{% endfor %}
+  extraArgs:
+    advertise-address: "{{ ansible_default_ipv4.address }}"
+  timeoutForControlPlane: 5m0s
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ ansible_default_ipv4.address }}"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+  imagePullPolicy: IfNotPresent
+  name: {{ inventory_hostname }}
+  taints: null
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
